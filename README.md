@@ -1,47 +1,26 @@
-# Keobiz — Salesforce Tech Test
+# Keobiz — Épreuve technique Salesforce
 
-Apex solution triggered on `Account` update. No Flow/Process Builder.
+## Architecture
 
-## What it does
-
-When `Account.MissionStatus__c` changes to `canceled`:
-
-- **(a)** Sets `MissionCanceledDate__c` to today
-- **(b)** Checks every contact linked to that account via `AccountContactRelation` — if **all** of a contact's accounts are canceled, sets `Contact.IsActive__c = false`
-- **(c)** Sends the deactivated contacts to the sync API via `PATCH`
-
-## Files
-
-| File | Role |
-|---|---|
-| `AccountTrigger.trigger` | Entry point — routes `before`/`after update` to handler |
-| `AccountTriggerHandler.cls` | `before`: stamps date in-memory. `after`: collects canceled accounts |
-| `ContactDeactivationService.cls` | Checks all relations per contact, deactivates, triggers sync |
-| `ContactSyncQueueable.cls` | Async wrapper so the callout runs outside the trigger transaction |
-| `ContactSyncService.cls` | Builds JSON payload, sends `PATCH`, logs non-200 responses |
-| `AccountTriggerHandlerTest.cls` | End-to-end tests via DML (includes 200-account bulk test) |
-| `ContactSyncServiceTest.cls` | Unit tests for HTTP method, headers, payload shape, error codes |
-| `ContactSyncHttpMock.cls` | `HttpCalloutMock` used by both test classes |
-
-## API
+Le code suit le pattern **un trigger par objet + handler**, avec une séparation en trois couches :
 
 ```
-PATCH https://fxyozmgb2xs5iogcheotxi6hoa0jdhiz.lambda-url.eu-central-1.on.aws
-Authorization: salesforceAuthToken
-Content-Type: application/json
-
-[{ "id": "<contactId>", "is_active": false }, ...]
+AccountTrigger
+    ├── before update → AccountTriggerHandler  (stamp de la date, sans DML supplémentaire)
+    └── after update  → AccountTriggerHandler
+                            └── ContactDeactivationService  (logique métier + DML contacts)
+                                    └── ContactSyncQueueable  (job asynchrone)
+                                            └── ContactSyncService  (appel HTTP)
 ```
 
-## Notes
+## Choix techniques
 
-- The trigger only fires on records **transitioning into** `canceled` — re-saving an already-canceled account does nothing.
-- All SOQL/DML is set-based (no queries in loops) — safe at 200 accounts per transaction.
-- Endpoint and token are constants for this exercise. In production they'd live in a Named Credential.
+**`before` pour la date** — la valeur est écrite directement sur l'enregistrement en mémoire, sans DML supplémentaire.
 
-## Deploy
+**Détection "nouvellement annulé"** — on compare `Trigger.new` à `Trigger.oldMap` pour n'agir que sur les comptes qui *passent* à `canceled`. Un re-save d'un compte déjà annulé ne redéclenche rien.
 
-```bash
-sf project deploy start --source-dir force-app
-sf apex run test --class-names AccountTriggerHandlerTest ContactSyncServiceTest --result-format human --wait 10
-```
+**Relecture de toutes les relations** — pour vérifier qu'un contact a bien *toutes* ses entreprises annulées, on relit l'ensemble de ses `AccountContactRelation`, pas uniquement celles des comptes concernés par le trigger. Un contact encore lié à une entreprise active reste actif.
+
+**Queueable pour le callout** — Salesforce interdit les callouts synchrones après un DML dans la même transaction. Le job `Queueable` (plutôt que `@future`) permet de passer une liste typée et implémente `Database.AllowsCallouts`.
+
+**Bulkification** — aucune SOQL/DML dans une boucle. Le nombre de requêtes est constant quel que soit le volume, ce qui garantit le respect des governor limits sur 200 comptes.
